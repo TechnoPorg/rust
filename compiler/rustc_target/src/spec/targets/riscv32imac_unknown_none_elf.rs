@@ -22,7 +22,7 @@ pub(crate) fn target() -> Target {
             pre_link_args: base::riscv::pre_link_args(),
             cpu: "generic-rv32".into(),
             max_atomic_width: Some(32),
-            features: "+m,+a,+c".into(),
+            features: "+m,+a,+c,+relax".into(),
             llvm_abiname: LlvmAbi::Ilp32,
             panic_strategy: PanicStrategy::Abort,
             relocation_model: RelocModel::Static,
