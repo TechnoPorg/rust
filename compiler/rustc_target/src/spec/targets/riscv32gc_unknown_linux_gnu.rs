@@ -19,11 +19,12 @@ pub(crate) fn target() -> Target {
         options: TargetOptions {
             code_model: Some(CodeModel::Medium),
             cpu: "generic-rv32".into(),
-            features: "+m,+a,+f,+d,+c,+zicsr,+zifencei".into(),
+            features: "+m,+a,+f,+d,+c,+zicsr,+zifencei,+relax".into(),
             llvm_abiname: LlvmAbi::Ilp32d,
             max_atomic_width: Some(32),
             supported_split_debuginfo: Cow::Borrowed(&[SplitDebuginfo::Off]),
             mcount: "\u{1}_mcount".into(),
+            pre_link_args: base::riscv::pre_link_args(),
             ..base::linux_gnu::opts()
         },
     }

@@ -1,5 +1,6 @@
 use crate::spec::{
-    Arch, Env, LlvmAbi, Os, PanicStrategy, RelocModel, Target, TargetMetadata, TargetOptions, cvs,
+    Arch, Env, LlvmAbi, Os, PanicStrategy, RelocModel, Target, TargetMetadata, TargetOptions, base,
+    cvs,
 };
 
 pub(crate) fn target() -> Target {
@@ -21,6 +22,7 @@ pub(crate) fn target() -> Target {
             env: Env::Newlib,
             vendor: "espressif".into(),
             linker: Some("riscv32-esp-elf-gcc".into()),
+            pre_link_args: base::riscv::pre_link_args(),
             cpu: "generic-rv32".into(),
 
             // While the RiscV32IMC architecture does not natively support atomics, ESP-IDF does support
@@ -31,7 +33,7 @@ pub(crate) fn target() -> Target {
             max_atomic_width: Some(32),
             atomic_cas: true,
 
-            features: "+m,+c".into(),
+            features: "+m,+c,+relax".into(),
             llvm_abiname: LlvmAbi::Ilp32,
             panic_strategy: PanicStrategy::Abort,
             relocation_model: RelocModel::Static,
