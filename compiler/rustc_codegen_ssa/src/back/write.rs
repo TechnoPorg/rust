@@ -1,14 +1,16 @@
+use std::cmp::min;
 use std::marker::PhantomData;
 use std::num::NonZero;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
 use std::{assert_matches, fs, io, str, thread};
 
 use rustc_abi::Size;
 use rustc_data_structures::jobserver::{self, Acquired};
 use rustc_data_structures::profiling::{SelfProfilerRef, VerboseTimingGuard};
+use rustc_data_structures::sync::{self, DynSend, DynSync, IntoDynSyncSend};
 use rustc_errors::emitter::Emitter;
 use rustc_errors::{
     Diag, DiagCtxt, DiagCtxtHandle, DiagInner, FatalError, FatalErrorMarker, Level,
@@ -433,16 +435,27 @@ pub(crate) fn start_async_codegen<B: WriteBackendMethods>(
     let (shared_emitter, shared_emitter_main) = SharedEmitter::new();
     let (codegen_worker_send, codegen_worker_receive) = channel();
 
+    let work_ctx = BackendWorkContext::new(tcx, shared_emitter, &backend, regular_config);
+
+    // This is the bounded queue the parallel frontend threads (if enabled) will use to send
+    // generated IR to the backend worker threads. If it's full, the frontend thread will do
+    // backend work inline (on the same thread that generated the IR).
+    let (parallel_ir_module_send, parallel_ir_module_receive) = match tcx.sess.opts.jobs.frontend {
+        JobsMode::Sequential => sync_channel(0),
+        JobsMode::Parallel(non_zero) => sync_channel(min(
+            non_zero.get(),
+            work_ctx.cgcx.parallel.map(NonZero::<usize>::get).unwrap_or_default(),
+        )),
+    };
+
     let coordinator_thread = start_executing_work(
-        backend.clone(),
-        tcx,
-        shared_emitter,
         codegen_worker_send,
         coordinator_receive,
-        regular_config,
+        parallel_ir_module_receive,
         allocator_config,
         allocator_module,
         coordinator_send.clone(),
+        work_ctx.clone(),
     );
 
     OngoingCodegen {
@@ -452,10 +465,12 @@ pub(crate) fn start_async_codegen<B: WriteBackendMethods>(
         shared_emitter_main,
         coordinator: Coordinator {
             sender: coordinator_send,
+            parallel_ir_module_send,
             future: Some(coordinator_thread),
             phantom: PhantomData,
         },
         output_filenames: Arc::clone(tcx.output_filenames(())),
+        work_ctx,
     }
 }
 
@@ -1160,7 +1175,13 @@ pub(crate) enum Message<B: WriteBackendMethods> {
 
     /// The backend has finished processing a work item for a codegen unit.
     /// Sent from a backend worker thread.
-    WorkItem { result: Result<WorkItemResult<B>, Option<WorkerFatalError>> },
+    WorkItem {
+        result: Result<WorkItemResult<B>, Option<WorkerFatalError>>,
+        /// If this ran on a frontend thread instead of one of our backend worker threads,
+        /// it does not participate in the coordinator's token accounting, but instead goes
+        /// through the jobserver proxy in the parallel frontend thread pool.
+        ran_on_frontend_thread: bool,
+    },
 
     /// The frontend has finished generating something (backend IR or a
     /// post-LTO artifact) for a codegen unit, and it should be passed to the
@@ -1170,6 +1191,10 @@ pub(crate) enum Message<B: WriteBackendMethods> {
     /// Similar to `CodegenDone`, but for reusing a pre-LTO artifact
     /// Sent from the main thread.
     AddImportOnlyModule { bitcode_path: PathBuf, work_product: WorkProduct },
+
+    /// A parallel frontend thread has sent a compiled CGU to the bounded channel.
+    /// Wake up the coordinator and add it to the work queue if there's room.
+    ParallelCgu,
 
     /// The frontend has finished generating everything for all codegen units.
     /// Sent from the main thread.
@@ -1208,20 +1233,15 @@ enum MainThreadState {
 }
 
 fn start_executing_work<B: WriteBackendMethods>(
-    backend: B,
-    tcx: TyCtxt<'_>,
-    shared_emitter: SharedEmitter,
     codegen_worker_send: Sender<CguMessage>,
     coordinator_receive: Receiver<Message<B>>,
-    regular_config: Arc<ModuleConfig>,
+    parallel_ir_module_receive: Receiver<(WorkItem<B>, u64)>,
     allocator_config: Arc<ModuleConfig>,
     mut allocator_module: Option<ModuleCodegen<B::Module>>,
     coordinator_send: Sender<Message<B>>,
+    work_ctx: BackendWorkContext,
 ) -> thread::JoinHandle<Result<MaybeLtoModules<B>, ()>> {
-    let sess = tcx.sess;
-    let prof = sess.prof.clone();
-    let incr_comp_session =
-        tcx.incr_comp_session.map(|incr_comp_session| incr_comp_session.borrow());
+    let BackendWorkContext { cgcx, prof, incr_comp_session, stack_size, shared_emitter } = work_ctx;
 
     // First up, convert our jobserver into a helper thread so we can use normal
     // mpsc channels to manage our messages and such.
@@ -1231,11 +1251,7 @@ fn start_executing_work<B: WriteBackendMethods>(
     // Note that using `jobserver::Proxy` is not necessary here, the code below always acquires
     // tokens before releasing them, so we can never accidentally release the last token
     // permanently held by rustc process.
-    let parallel = match sess.opts.jobs.backend {
-        JobsMode::Parallel(n) if backend.supports_parallel() => Some(n),
-        _ => None,
-    };
-    let jobserver_helper = parallel.map(|_| {
+    let jobserver_helper = cgcx.parallel.map(|_| {
         let coordinator_send2 = coordinator_send.clone();
         jobserver::client()
             .into_helper_thread(move |token| {
@@ -1243,45 +1259,6 @@ fn start_executing_work<B: WriteBackendMethods>(
             })
             .expect("failed to spawn helper thread")
     });
-
-    let remark_dir = if let Some(ref dir) = sess.opts.unstable_opts.remark_dir {
-        let result = fs::create_dir_all(dir).and_then(|_| dir.canonicalize());
-        match result {
-            Ok(dir) => Some(dir),
-            Err(error) => sess.dcx().emit_fatal(ErrorCreatingRemarkDir { error }),
-        }
-    } else {
-        None
-    };
-
-    let stack_size = sess.opts.recommended_stack_size;
-
-    let cgcx = CodegenContext {
-        crate_types: tcx.crate_types().to_vec(),
-        lto: sess.lto(),
-        use_linker_plugin_lto: sess.opts.cg.linker_plugin_lto.enabled(),
-        dylib_lto: sess.opts.unstable_opts.dylib_lto,
-        prefer_dynamic: sess.opts.cg.prefer_dynamic,
-        fewer_names: sess.fewer_names(),
-        save_temps: sess.opts.cg.save_temps,
-        time_trace: sess.opts.unstable_opts.llvm_time_trace,
-        remark: sess.opts.cg.remark.clone(),
-        remark_dir,
-        output_filenames: Arc::clone(tcx.output_filenames(())),
-        module_config: regular_config,
-        msvc_imps_needed: msvc_imps_needed(tcx),
-        is_pe_coff: tcx.sess.target.is_like_windows,
-        target_can_use_split_dwarf: tcx.sess.target_can_use_split_dwarf(),
-        target_arch: tcx.sess.target.arch.to_string(),
-        target_is_like_darwin: tcx.sess.target.is_like_darwin,
-        target_is_like_aix: tcx.sess.target.is_like_aix,
-        target_is_like_gpu: tcx.sess.target.is_like_gpu,
-        rust_eh_personality_symbol: rustc_symbol_mangling::eh_personality_symbol(tcx),
-        split_debuginfo: tcx.sess.split_debuginfo(),
-        split_dwarf_kind: tcx.sess.opts.unstable_opts.split_dwarf_kind,
-        parallel,
-        pointer_size: tcx.data_layout.pointer_size(),
-    };
 
     // This is the "main loop" of parallel work happening for parallel codegen.
     // It's here that we manage parallelism, schedule work, and work with
@@ -1461,6 +1438,33 @@ fn start_executing_work<B: WriteBackendMethods>(
                 + if main_thread_state == MainThreadState::Lending { 1 } else { 0 }
         };
 
+        // We keep the queue sorted by estimated processing cost,
+        // so that more expensive items are processed earlier. This
+        // is good for throughput as it gives the main thread more
+        // time to fill up the queue and it avoids scheduling
+        // expensive items to the end.
+        // Note, however, that this is not ideal for memory
+        // consumption, as LLVM module sizes are not evenly
+        // distributed.
+        let queue_work_item = |work_items: &mut Vec<(WorkItem<B>, u64)>,
+                               llvm_work_item: WorkItem<B>,
+                               cost: u64,
+                               main_thread_state: MainThreadState,
+                               running_with_own_token: usize| {
+            let insertion_index = work_items.binary_search_by_key(&cost, |&(_, cost)| cost);
+            let insertion_index = match insertion_index {
+                Ok(idx) | Err(idx) => idx,
+            };
+            work_items.insert(insertion_index, (llvm_work_item, cost));
+
+            if let Some(helper) = &jobserver_helper
+                && running_with_any_token(main_thread_state, running_with_own_token)
+                    < cgcx.parallel.unwrap().get()
+            {
+                helper.request_token();
+            }
+        };
+
         let mut llvm_start_time: Option<VerboseTimingGuard<'_>> = None;
 
         if let Some(allocator_module) = &mut allocator_module {
@@ -1495,6 +1499,14 @@ fn start_executing_work<B: WriteBackendMethods>(
                             panic!("Could not send CguMessage to main thread")
                         }
                         main_thread_state = MainThreadState::Codegenning;
+                        // The CguMessage sender only exists for the serial frontend, and once
+                        // it's removed we can simplify this a bit. However, the two frontends map onto
+                        // the same coordinator surprisingly well:
+                        // - Before the PF has finished generating all IR, the main thread state will become
+                        //   `Codegenning`. The implicit token then goes to the main thread and par_map, where the
+                        //   parallel frontend thread pool is using the implicit token through its jobserver proxy.
+                        // - Once all IR is generated, there are no more parallel frontend threads, we receive `CodegenComplete`
+                        //   and proceed in the usual manner
                     } else {
                         // The queue is full enough to not let the worker
                         // threads starve. Use the implicit Token to do some
@@ -1511,6 +1523,7 @@ fn start_executing_work<B: WriteBackendMethods>(
                             &mut llvm_start_time,
                             item,
                             stack_size,
+                            false,
                         );
                     }
                 }
@@ -1538,6 +1551,7 @@ fn start_executing_work<B: WriteBackendMethods>(
                                 &mut llvm_start_time,
                                 item,
                                 stack_size,
+                                false,
                             );
                         } else {
                             // There is no unstarted work, so let the main thread
@@ -1583,6 +1597,7 @@ fn start_executing_work<B: WriteBackendMethods>(
                         &mut llvm_start_time,
                         item,
                         stack_size,
+                        false,
                     );
                     running_with_own_token += 1;
                 }
@@ -1618,26 +1633,13 @@ fn start_executing_work<B: WriteBackendMethods>(
                 }
 
                 Message::CodegenDone { llvm_work_item, cost } => {
-                    // We keep the queue sorted by estimated processing cost,
-                    // so that more expensive items are processed earlier. This
-                    // is good for throughput as it gives the main thread more
-                    // time to fill up the queue and it avoids scheduling
-                    // expensive items to the end.
-                    // Note, however, that this is not ideal for memory
-                    // consumption, as LLVM module sizes are not evenly
-                    // distributed.
-                    let insertion_index = work_items.binary_search_by_key(&cost, |&(_, cost)| cost);
-                    let insertion_index = match insertion_index {
-                        Ok(idx) | Err(idx) => idx,
-                    };
-                    work_items.insert(insertion_index, (llvm_work_item, cost));
-
-                    if let Some(helper) = &jobserver_helper
-                        && running_with_any_token(main_thread_state, running_with_own_token)
-                            < cgcx.parallel.unwrap().get()
-                    {
-                        helper.request_token();
-                    }
+                    queue_work_item(
+                        &mut work_items,
+                        llvm_work_item,
+                        cost,
+                        main_thread_state,
+                        running_with_own_token,
+                    );
                     assert_eq!(main_thread_state, MainThreadState::Codegenning);
                     main_thread_state = MainThreadState::Idle;
                 }
@@ -1661,16 +1663,19 @@ fn start_executing_work<B: WriteBackendMethods>(
                     codegen_state = Aborted;
                 }
 
-                Message::WorkItem { result } => {
+                Message::WorkItem { result, ran_on_frontend_thread } => {
                     // If a thread exits successfully then we drop a token associated
                     // with that worker and update our `running_with_own_token` count.
                     // We may later re-acquire a token to continue running more work.
                     // We may also not actually drop a token here if the worker was
                     // running with an "ephemeral token".
-                    if main_thread_state == MainThreadState::Lending {
-                        main_thread_state = MainThreadState::Idle;
-                    } else {
-                        running_with_own_token -= 1;
+                    // Frontend threads have their jobserver tokens managed by the frontend thread pool.
+                    if !ran_on_frontend_thread {
+                        if main_thread_state == MainThreadState::Lending {
+                            main_thread_state = MainThreadState::Idle;
+                        } else {
+                            running_with_own_token -= 1;
+                        }
                     }
 
                     match result {
@@ -1705,6 +1710,32 @@ fn start_executing_work<B: WriteBackendMethods>(
                     assert_eq!(main_thread_state, MainThreadState::Codegenning);
                     lto_import_only_modules.push((bitcode_path, work_product));
                     main_thread_state = MainThreadState::Idle;
+                }
+
+                // Wake up, coordinator! We keep this separate from CodegenDone so that the parallel
+                // frontend can use its own work item queue for backpressure purposes.
+                Message::ParallelCgu => {}
+            }
+
+            loop {
+                let extra_tokens = tokens.len().checked_sub(running_with_own_token).unwrap();
+                let additional_running = std::cmp::min(extra_tokens, work_items.len());
+                let anticipated_running = running_with_own_token + additional_running + 1;
+
+                if queue_full_enough(work_items.len(), anticipated_running) {
+                    break;
+                }
+
+                if let Ok((llvm_work_item, cost)) = parallel_ir_module_receive.try_recv() {
+                    queue_work_item(
+                        &mut work_items,
+                        llvm_work_item,
+                        cost,
+                        main_thread_state,
+                        running_with_own_token,
+                    );
+                } else {
+                    break;
                 }
             }
         }
@@ -1850,8 +1881,10 @@ fn spawn_work<'a, B: WriteBackendMethods>(
     llvm_start_time: &mut Option<VerboseTimingGuard<'a>>,
     work: WorkItem<B>,
     stack_size: usize,
+    on_frontend_thread: bool,
 ) {
-    if llvm_start_time.is_none() {
+    if llvm_start_time.is_none() && !on_frontend_thread {
+        // The frontend threads won't do work inline before the first worker threads get spun up
         *llvm_start_time = Some(prof.verbose_generic_activity("LLVM_passes"));
     }
 
@@ -1887,24 +1920,36 @@ fn spawn_work<'a, B: WriteBackendMethods>(
         }));
 
         let msg = match result {
-            Ok(result) => Message::WorkItem::<B> { result: Ok(result) },
+            Ok(result) => Message::WorkItem::<B> {
+                result: Ok(result),
+                ran_on_frontend_thread: on_frontend_thread,
+            },
 
             // We ignore any `FatalError` coming out of `execute_work_item`, as a
             // diagnostic was already sent off to the main thread - just surface
             // that there was an error in this worker.
-            Err(err) if err.is::<FatalErrorMarker>() => {
-                Message::WorkItem::<B> { result: Err(Some(WorkerFatalError)) }
-            }
+            Err(err) if err.is::<FatalErrorMarker>() => Message::WorkItem::<B> {
+                result: Err(Some(WorkerFatalError)),
+                ran_on_frontend_thread: on_frontend_thread,
+            },
 
-            Err(_) => Message::WorkItem::<B> { result: Err(None) },
+            Err(_) => Message::WorkItem::<B> {
+                result: Err(None),
+                ran_on_frontend_thread: on_frontend_thread,
+            },
         };
         drop(coordinator_send.send(msg));
     };
-    std::thread::Builder::new()
-        .name(name)
-        .stack_size(stack_size)
-        .spawn(f)
-        .expect("failed to spawn work thread");
+    if on_frontend_thread {
+        // Frontend threads and backend threads use the same stack size, so running inline is no more likely to run out of stack
+        f();
+    } else {
+        std::thread::Builder::new()
+            .name(name)
+            .stack_size(stack_size)
+            .spawn(f)
+            .expect("failed to spawn work thread");
+    }
 }
 
 fn spawn_thin_lto_work<B: WriteBackendMethods>(
@@ -1980,6 +2025,13 @@ pub struct InlineAsmError {
 #[derive(Clone)]
 pub struct SharedEmitter {
     sender: Sender<SharedEmitterMessage>,
+}
+
+unsafe impl DynSend for SharedEmitter {}
+unsafe impl DynSync for SharedEmitter {}
+fn _assert_emitter_fields() {
+    sync::assert_dyn_sync::<IntoDynSyncSend<Sender<SharedEmitterMessage>>>();
+    sync::assert_dyn_send::<IntoDynSyncSend<Sender<SharedEmitterMessage>>>();
 }
 
 pub struct SharedEmitterMain {
@@ -2073,6 +2125,11 @@ impl SharedEmitterMain {
 
 pub struct Coordinator<B: WriteBackendMethods> {
     sender: Sender<Message<B>>,
+    /// Used by the parallel frontend to send LLVM IR to worker threads.
+    /// FIXME: `Coordinator` can probably be simplified to only have one sender
+    /// once LTO modules are moved out of the codegen coordinator as described
+    /// in https://github.com/rust-lang/compiler-team/issues/908.
+    parallel_ir_module_send: SyncSender<(WorkItem<B>, u64)>,
     future: Option<thread::JoinHandle<Result<MaybeLtoModules<B>, ()>>>,
     // Only used for the Message type.
     phantom: PhantomData<B>,
@@ -2102,8 +2159,77 @@ pub struct OngoingCodegen<B: WriteBackendMethods> {
     // drop and prematurely close channels used by coordinator thread. See `Coordinator`'s
     // `Drop` implementation for more info.
     pub(crate) coordinator: Coordinator<B>,
+    pub(crate) work_ctx: BackendWorkContext,
     codegen_worker_receive: Receiver<CguMessage>,
     shared_emitter_main: SharedEmitterMain,
+}
+
+#[derive(Clone)]
+pub(crate) struct BackendWorkContext {
+    cgcx: CodegenContext,
+    prof: SelfProfilerRef,
+    incr_comp_session: Option<BorrowedIncrCompSession>,
+    stack_size: usize,
+    shared_emitter: SharedEmitter,
+}
+
+impl BackendWorkContext {
+    fn new<B: WriteBackendMethods>(
+        tcx: TyCtxt<'_>,
+        shared_emitter: SharedEmitter,
+        backend: &B,
+        module_config: Arc<ModuleConfig>,
+    ) -> Self {
+        let sess = tcx.sess;
+        let backend_parallelism = match sess.opts.jobs.backend {
+            JobsMode::Parallel(n) if backend.supports_parallel() => Some(n),
+            _ => None,
+        };
+
+        let prof = sess.prof.clone();
+        let incr_comp_session =
+            tcx.incr_comp_session.map(|incr_comp_session| incr_comp_session.borrow());
+        let stack_size = sess.opts.recommended_stack_size;
+
+        let remark_dir = if let Some(ref dir) = sess.opts.unstable_opts.remark_dir {
+            let result = fs::create_dir_all(dir).and_then(|_| dir.canonicalize());
+            match result {
+                Ok(dir) => Some(dir),
+                Err(error) => sess.dcx().emit_fatal(ErrorCreatingRemarkDir { error }),
+            }
+        } else {
+            None
+        };
+
+        let cgcx = CodegenContext {
+            crate_types: tcx.crate_types().to_vec(),
+            lto: sess.lto(),
+            use_linker_plugin_lto: sess.opts.cg.linker_plugin_lto.enabled(),
+            dylib_lto: sess.opts.unstable_opts.dylib_lto,
+            prefer_dynamic: sess.opts.cg.prefer_dynamic,
+            fewer_names: sess.fewer_names(),
+            save_temps: sess.opts.cg.save_temps,
+            time_trace: sess.opts.unstable_opts.llvm_time_trace,
+            remark: sess.opts.cg.remark.clone(),
+            remark_dir,
+            output_filenames: Arc::clone(tcx.output_filenames(())),
+            module_config,
+            msvc_imps_needed: msvc_imps_needed(tcx),
+            is_pe_coff: tcx.sess.target.is_like_windows,
+            target_can_use_split_dwarf: tcx.sess.target_can_use_split_dwarf(),
+            target_arch: tcx.sess.target.arch.to_string(),
+            target_is_like_darwin: tcx.sess.target.is_like_darwin,
+            target_is_like_aix: tcx.sess.target.is_like_aix,
+            target_is_like_gpu: tcx.sess.target.is_like_gpu,
+            rust_eh_personality_symbol: rustc_symbol_mangling::eh_personality_symbol(tcx),
+            split_debuginfo: tcx.sess.split_debuginfo(),
+            split_dwarf_kind: tcx.sess.opts.unstable_opts.split_dwarf_kind,
+            parallel: backend_parallelism,
+            pointer_size: tcx.data_layout.pointer_size(),
+        };
+
+        BackendWorkContext { cgcx, prof, incr_comp_session, stack_size, shared_emitter }
+    }
 }
 
 impl<B: WriteBackendMethods> OngoingCodegen<B> {
@@ -2113,6 +2239,8 @@ impl<B: WriteBackendMethods> OngoingCodegen<B> {
         incr_comp_session: Option<&mut IncrCompSession>,
         crate_info: &CrateInfo,
     ) -> CompiledModules {
+        // This contains the last shared emitter sender
+        drop(self.work_ctx);
         self.shared_emitter_main.check(sess, true);
 
         let maybe_lto_modules = sess.time("join_worker_thread", || match self.coordinator.join() {
@@ -2237,11 +2365,34 @@ impl<B: WriteBackendMethods> OngoingCodegen<B> {
 
 pub(crate) fn submit_codegened_module_to_llvm<B: WriteBackendMethods>(
     coordinator: &Coordinator<B>,
+    work_ctx: &BackendWorkContext,
     module: ModuleCodegen<B::Module>,
     cost: u64,
+    from_frontend_thread: bool,
 ) {
     let llvm_work_item = WorkItem::Optimize(module);
-    drop(coordinator.sender.send(Message::CodegenDone::<B> { llvm_work_item, cost }));
+
+    if from_frontend_thread {
+        match coordinator.parallel_ir_module_send.try_send((llvm_work_item, cost)) {
+            Ok(()) => {
+                drop(coordinator.sender.send(Message::ParallelCgu));
+            }
+            Err(TrySendError::Full((llvm_work_item, _cost))) => spawn_work(
+                &work_ctx.cgcx,
+                &work_ctx.prof,
+                work_ctx.incr_comp_session.as_ref(),
+                work_ctx.shared_emitter.clone(),
+                coordinator.sender.clone(),
+                &mut None,
+                llvm_work_item,
+                work_ctx.stack_size,
+                true,
+            ),
+            Err(TrySendError::Disconnected(work_item)) => drop(work_item),
+        }
+    } else {
+        drop(coordinator.sender.send(Message::CodegenDone::<B> { llvm_work_item, cost }));
+    }
 }
 
 pub(crate) fn submit_post_lto_module_to_llvm<B: WriteBackendMethods>(
