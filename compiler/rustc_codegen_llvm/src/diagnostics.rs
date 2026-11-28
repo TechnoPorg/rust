@@ -133,6 +133,11 @@ pub(crate) struct TpdeHighOptLevel;
 pub(crate) struct TpdeLtoUsed;
 
 #[derive(Diagnostic)]
+#[diag("using -Zllvm-tpde without the parallel frontend will have little effect on compile times")]
+#[note("try passing --jobs-frontend=<N> to rustc")]
+pub(crate) struct TpdeSerialFrontend;
+
+#[derive(Diagnostic)]
 #[diag("using -Zllvm-tpde with split debuginfo is not supported")]
 pub(crate) struct TpdeSplitDebugInfoUsed;
 

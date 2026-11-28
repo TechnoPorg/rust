@@ -24,7 +24,7 @@ use rustc_errors::{DiagCtxt, DiagCtxtHandle};
 use rustc_metadata::EncodedMetadata;
 use rustc_middle::dep_graph::{BorrowedIncrCompSession, IncrCompSession, WorkProduct};
 use rustc_middle::ty::TyCtxt;
-use rustc_session::config::{LtoCli, OptLevel, OutputFilenames, PrintKind, PrintRequest};
+use rustc_session::config::{JobsMode, LtoCli, OptLevel, OutputFilenames, PrintKind, PrintRequest};
 use rustc_session::{CodegenBackendInit, EarlySession, Session};
 use rustc_span::{Symbol, sym};
 use rustc_target::spec::{RelocModel, SplitDebuginfo, TlsModel};
@@ -237,6 +237,10 @@ impl CodegenBackend for LlvmCodegenBackend {
             if sess.opts.unstable_opts.llvm_tpde.is_some() {
                 if !matches!(sess.opts.optimize, OptLevel::No | OptLevel::Less) {
                     sess.dcx().emit_warn(crate::diagnostics::TpdeHighOptLevel);
+                }
+
+                if matches!(sess.opts.jobs.frontend, JobsMode::Sequential) {
+                    sess.dcx().emit_warn(crate::diagnostics::TpdeSerialFrontend);
                 }
 
                 if sess.target.requires_lto
